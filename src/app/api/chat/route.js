@@ -22,7 +22,7 @@ export async function POST(req) {
     let audioBase64 = null;
     if (elevenLabs && voice_response) {
       try {
-        const audioStream = await elevenLabs.textToSpeech.convert("JBFqnCBsd6RMkjVDRZzb", {
+        const audioStream = await elevenLabs.textToSpeech.convert(process.env.ELEVENLABS_VOICE_ID || "JBFqnCBsd6RMkjVDRZzb", {
           text: voice_response,
           model_id: "eleven_multilingual_v2",
           output_format: "mp3_44100_128",
