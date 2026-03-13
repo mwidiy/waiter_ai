@@ -1,7 +1,7 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
 import { motion } from "framer-motion";
-import { Mic, MicOff, Loader2, ShoppingCart, MessageCircle, MoreHorizontal } from "lucide-react";
+import { Mic, MicOff, Loader2, ShoppingCart, Power, Volume2 } from "lucide-react";
 
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
@@ -9,36 +9,63 @@ export default function Home() {
   const [recordingStatus, setRecordingStatus] = useState("Tap microphone to order");
   const [history, setHistory] = useState([]);
   const [cartCount, setCartCount] = useState(0);
+  const [isLiveMode, setIsLiveMode] = useState(false);
+  const [currentVolume, setCurrentVolume] = useState(0); // Added volume monitor
+  const isLiveModeRef = useRef(false);
   
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
   // VAD refs
   const audioContextRef = useRef(null);
   const analyserRef = useRef(null);
+  const microphoneRef = useRef(null); // Added this to track the microphone source
   const silenceTimerRef = useRef(null);
   const isSpeakingRef = useRef(false);
   const streamRef = useRef(null);
-  const SILENCE_THRESHOLD = 15; // adjust threshold (0-255) based on room noise
-  const SILENCE_DURATION_MS = 2000; // wait 2s of silence before stopping
+  const SILENCE_THRESHOLD = 40; // Increased significantly for mobile
+  const SILENCE_DURATION_MS = 1200; // wait 1.2s to feel much snappier
 
   const startRecording = async () => {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
+      let stream = streamRef.current;
+      if (!stream || stream.getAudioTracks().every(v => v.readyState === 'ended')) {
+         stream = await navigator.mediaDevices.getUserMedia({ 
+           audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } 
+         });
+         streamRef.current = stream;
+      }
       
-      // Setup VAD
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      const analyser = audioContext.createAnalyser();
+      let audioContext = audioContextRef.current;
+      if (!audioContext || audioContext.state === 'closed') {
+         audioContext = new (window.AudioContext || window.webkitAudioContext)();
+         audioContextRef.current = audioContext;
+      }
+      if (audioContext.state === 'suspended') await audioContext.resume();
+
+      if (!analyserRef.current) {
+         const analyser = audioContext.createAnalyser();
+         analyser.minDecibels = -90;
+         analyser.maxDecibels = -10;
+         analyser.smoothingTimeConstant = 0.85;
+         analyser.fftSize = 256;
+         analyserRef.current = analyser;
+
+         // CRAZY HACK FOR SAFARI & CHROME MOBILE:
+         // Browsers will pause the audio processing graph if it doesn't eventually output to the speaker.
+         // We create a dummy volume node, set it to 0 (muting it), and plug the mic into it and the speaker so the browser is tricked into running the Analyser forever.
+         const dummyGain = audioContext.createGain();
+         dummyGain.gain.value = 0;
+         analyser.connect(dummyGain);
+         dummyGain.connect(audioContext.destination);
+      }
+      
+      // ALWAYS reconnect the new stream to the analyser
+      if (microphoneRef.current) {
+         microphoneRef.current.disconnect();
+      }
       const microphone = audioContext.createMediaStreamSource(stream);
-      
-      analyser.minDecibels = -90;
-      analyser.maxDecibels = -10;
-      analyser.smoothingTimeConstant = 0.85;
-      analyser.fftSize = 256;
-      microphone.connect(analyser);
-      
-      audioContextRef.current = audioContext;
-      analyserRef.current = analyser;
+      microphone.connect(analyserRef.current);
+      microphoneRef.current = microphone;
 
       mediaRecorderRef.current = new MediaRecorder(stream);
       audioChunksRef.current = [];
@@ -56,7 +83,6 @@ export default function Home() {
       setIsRecording(true);
       setRecordingStatus("Listening... (Auto-stops when you finish speaking)");
       
-      // Start checking volume
       monitorSilence();
 
     } catch (error) {
@@ -66,7 +92,7 @@ export default function Home() {
   };
 
   const monitorSilence = () => {
-    if (!analyserRef.current || !isRecording) return;
+    if (!analyserRef.current) return;
     
     const bufferLength = analyserRef.current.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
@@ -102,6 +128,9 @@ export default function Home() {
           }
        }
 
+       // Update volume UI every few frames
+       if (Math.random() < 0.1) setCurrentVolume(Math.round(average));
+
        requestAnimationFrame(checkVolume);
     };
     
@@ -114,19 +143,40 @@ export default function Home() {
       setIsRecording(false);
       setRecordingStatus("Processing audio...");
       
-      // Cleanup VAD
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-      if (audioContextRef.current) {
-         audioContextRef.current.close();
-         audioContextRef.current = null;
-      }
       isSpeakingRef.current = false;
 
-      // Stop mic tracks
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach(t => t.stop());
-        streamRef.current = null;
+      // DO NOT close AudioContext and Mic in Live Mode to keep it warm for mobile
+      if (!isLiveModeRef.current) {
+         if (audioContextRef.current) {
+            audioContextRef.current.close().catch(e=>e);
+            audioContextRef.current = null;
+         }
+         analyserRef.current = null;
+         if (microphoneRef.current) {
+            microphoneRef.current.disconnect();
+            microphoneRef.current = null;
+         }
+         if (streamRef.current) {
+           streamRef.current.getTracks().forEach(t => t.stop());
+           streamRef.current = null;
+         }
       }
+    } else if (!isLiveModeRef.current) {
+       // Deep cleanup if not recording and turning off
+       if (audioContextRef.current) {
+          audioContextRef.current.close().catch(e=>e);
+          audioContextRef.current = null;
+       }
+       analyserRef.current = null;
+       if (microphoneRef.current) {
+          microphoneRef.current.disconnect();
+          microphoneRef.current = null;
+       }
+       if (streamRef.current) {
+         streamRef.current.getTracks().forEach(t => t.stop());
+         streamRef.current = null;
+       }
     }
   };
 
@@ -173,17 +223,69 @@ export default function Home() {
         setIsPlaying(true);
         audio.onended = () => {
           setIsPlaying(false);
-          setRecordingStatus(chatData.cartUpdated ? "Order completed! Tap to order again." : "Tap to speak again");
-          // Optionally, auto-restart recording here if you want it completely hands-free:
-          // startRecording();
+          setRecordingStatus(chatData.cartUpdated ? "Order completed!" : "Tap to speak again");
+          if (isLiveModeRef.current) {
+            startRecording(); // Auto resume listening in Live Mode
+          }
         };
         audio.play();
       } else {
         setRecordingStatus("Tap microphone to review or add more.");
+        if (isLiveModeRef.current) startRecording();
       }
     } catch (err) {
       console.error(err);
       setRecordingStatus("An error occurred.");
+      if (isLiveModeRef.current) startRecording();
+    }
+  };
+
+  const toggleLiveMode = async () => {
+    if (isLiveModeRef.current) {
+      isLiveModeRef.current = false;
+      setIsLiveMode(false);
+      stopRecording();
+      setRecordingStatus("Live Mode Disabled.");
+    } else {
+      isLiveModeRef.current = true;
+      setIsLiveMode(true);
+      setRecordingStatus("Oyan is greeting...");
+      
+      // EARLY INIT FOR MOBILE GESTURE
+      try {
+        if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
+           audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+        }
+        if (audioContextRef.current.state === 'suspended') await audioContextRef.current.resume();
+        
+        if (!streamRef.current || streamRef.current.getAudioTracks().every(v => v.readyState === 'ended')) {
+           streamRef.current = await navigator.mediaDevices.getUserMedia({ 
+             audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: false } 
+           });
+        }
+      } catch(e) { console.error('Early mic init failed', e); }
+
+      try {
+        const res = await fetch("/api/greet");
+        const data = await res.json();
+        
+        if (data.audioBase64) {
+          const audio = new Audio("data:audio/mp3;base64," + data.audioBase64);
+          setIsPlaying(true);
+          audio.onended = () => {
+            setIsPlaying(false);
+            if (isLiveModeRef.current) {
+              setRecordingStatus("Listening...");
+              startRecording();
+            }
+          };
+          audio.play();
+        } else {
+          startRecording();
+        }
+      } catch (e) {
+        startRecording();
+      }
     }
   };
 
@@ -265,6 +367,11 @@ export default function Home() {
             <p className="text-neutral-400 font-medium text-sm tracking-widest uppercase">
               {recordingStatus}
             </p>
+            {isRecording && (
+              <p className="text-neutral-600 text-xs mt-2">
+                Vol: {currentVolume} / {SILENCE_THRESHOLD}
+              </p>
+            )}
           </div>
         </div>
 
@@ -284,30 +391,48 @@ export default function Home() {
       </main>
 
       {/* Mic Button Fixed Bottom */}
-      <div className="fixed bottom-10 left-0 w-full flex justify-center z-50 px-6">
+      <div className="fixed bottom-10 left-0 w-full flex flex-col items-center z-50 px-6 gap-4">
+        
+        {/* Live Mode Toggle */}
         <motion.button
           whileHover={{ scale: 1.05 }}
           whileTap={{ scale: 0.95 }}
-          onClick={isRecording ? stopRecording : startRecording}
-          disabled={recordingStatus.includes("Processing") || recordingStatus.includes("thinking") || isPlaying}
-          className={`h-16 w-full max-w-xs rounded-full flex items-center justify-center gap-2 text-lg font-semibold shadow-2xl transition-colors ${
-            isRecording 
-              ? 'bg-rose-500 hover:bg-rose-600 text-white' 
-              : isPlaying || recordingStatus.includes("Processing") || recordingStatus.includes("thinking")
-                ? 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
-                : 'bg-white text-neutral-950 hover:bg-neutral-200'
+          onClick={toggleLiveMode}
+          className={`px-6 py-3 rounded-full flex items-center justify-center gap-2 text-sm font-bold shadow-xl transition-all border ${
+            isLiveMode
+              ? 'bg-rose-500/10 border-rose-500/50 text-rose-500 hover:bg-rose-500/20'
+              : 'bg-neutral-900 border-neutral-700 text-neutral-400 hover:text-white'
           }`}
         >
-          {isRecording ? (
-            <>
-              <div className="w-2 h-2 rounded-full bg-white animate-pulse" /> Stop Recording
-            </>
-          ) : (
-            <>
-              <Mic className="w-5 h-5" /> Push to Speak
-            </>
-          )}
+          <Power className="w-4 h-4" /> 
+          {isLiveMode ? "AKHIRI SHIFT" : "MULAI SHIFT WAITER"}
         </motion.button>
+
+        {!isLiveMode && (
+          <motion.button
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            onClick={isRecording ? stopRecording : startRecording}
+            disabled={recordingStatus.includes("Processing") || recordingStatus.includes("thinking") || isPlaying}
+            className={`h-14 w-full max-w-xs rounded-full flex items-center justify-center gap-2 font-semibold shadow-2xl transition-colors ${
+              isRecording 
+                ? 'bg-rose-500 hover:bg-rose-600 text-white' 
+                : isPlaying || recordingStatus.includes("Processing") || recordingStatus.includes("thinking")
+                  ? 'bg-neutral-800 text-neutral-500 cursor-not-allowed'
+                  : 'bg-white text-neutral-950 hover:bg-neutral-200'
+            }`}
+          >
+            {isRecording ? (
+              <>
+                <div className="w-2 h-2 rounded-full bg-white animate-pulse" /> Berhenti Merekam
+              </>
+            ) : (
+              <>
+                <Mic className="w-5 h-5" /> Push to Speak (Manual)
+              </>
+            )}
+          </motion.button>
+        )}
       </div>
     </div>
   );

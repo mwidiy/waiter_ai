@@ -9,37 +9,48 @@ for (let i = 1; i <= 25; i++) {
   }
 }
 
-function getRandomKey() {
-  if (openRouterKeys.length === 0) throw new Error('No OpenRouter API keys found');
-  const randomIndex = Math.floor(Math.random() * openRouterKeys.length);
-  return openRouterKeys[randomIndex];
-}
-
 export async function callOpenRouter(messages) {
-  const apiKey = getRandomKey();
+  if (openRouterKeys.length === 0) throw new Error('No API keys');
   
-  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      "model": "openrouter/free", // robust free model picker
-      "messages": messages
-    })
-  });
+  // Shuffle keys to distribute load and serve as fallback queue
+  const keys = [...openRouterKeys].sort(() => 0.5 - Math.random());
+  
+  for (const apiKey of keys) {
+    try {
+      const controller = new AbortController();
+      // Extremely strict 3.5s latency timeout per key
+      const timeoutId = setTimeout(() => controller.abort(), 3500); 
+      
+      const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${apiKey}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          "model": "openrouter/free",
+          "messages": messages
+        }),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
 
-  const data = await response.json();
-  if (!response.ok) {
-    const errorMsg = data.error ? data.error.message : response.statusText;
-    throw new Error(`OpenRouter HTTP ${response.status}: ${errorMsg}`);
-  }
+      const data = await response.json();
+      if (!response.ok) {
+        console.warn(`[OpenRouter] Key failed with ${response.status}. Retrying...`);
+        continue;
+      }
 
-  if (data.choices && data.choices.length > 0) {
-    return data.choices[0].message.content || "{}";
+      if (data.choices && data.choices.length > 0) {
+        return data.choices[0].message.content || "{}";
+      }
+    } catch (err) {
+      console.warn(`[OpenRouter] Key timed out or aborted. Retrying next key...`);
+      continue;
+    }
   }
-  return "{}";
+  
+  throw new Error("All OpenRouter API keys failed or timed out.");
 }
 
 export async function generateWaiterResponse(userText, conversationHistory = []) {
@@ -48,38 +59,19 @@ export async function generateWaiterResponse(userText, conversationHistory = [])
   const menuItems = await getMenu(storeId);
   const menuText = menuItems.map(m => `- ${m.name} (ID: ${m.id}) - Rp ${m.price}`).join('\n');
 
-  // 2. Build System Prompt for JSON structured output
-  const systemPrompt = `Kamu adalah kasir/waiter AI yang ramah, asik, berkaliber profesional, dan memposisikan dirimu sebagai teman dari pembeli restoran "Oyan".
-Bicaralah dengan bahasa Indonesia kasual yang natural, gaul tapi sopan (pakai kata lo/gue atau Kak/Mas/Mbak). 
-
-Tugasmu:
-1. Melayani pertanyaan seputar menu.
-2. Menerima pesanan dari pelanggan.
-3. JIKA pelanggan sudah mengkonfirmasi pesanan dan ingin selesai/membayar/checkout, kamu HARUS mengekstrak pesanan mereka ke dalam output JSON.
-
-Berikut adalah daftar menu yang tersedia:
-${menuText}
-
-ATURAN OUTPUT:
-Kamu HARUS merespons HANYA dalam format JSON valid (tanpa markdown backticks). Skema JSON-nya adalah:
+  // 2. Build Ultra-Short System Prompt for Low Latency
+  const systemPrompt = `Kamu Waiter AI Resto Oyan. Singkat, ramah, gaul (lo/gue).
+Jawab SEMUA input dengan JSON VALID. DILARANG ada teks di luar JSON.
+FORMAT:
 {
-  "voice_response": "teks balasan kamu ke pembeli yang akan dibacakan oleh voice AI (natural, ramah, dan asik)",
-  "orders_to_checkout": [
-    {
-      "productId": 13,
-      "quantity": 2,
-      "priceSnapshot": 15000,
-      "note": "catatan khusus jika ada"
-    }
-  ],
-  "is_checkout_confirmed": boolean
+"voice_response": "balasan lisan ke pembeli (singkat 1 kalimat)",
+"orders_to_checkout": [{"productId": 1, "quantity": 1}],
+"is_checkout_confirmed": false
 }
-
-Catatan:
-- "voice_response" adalah apa yang kamu katakan secara vokal ke user.
-- "orders_to_checkout" diisi dengan array object produk JIKA dan HANYA JIKA "is_checkout_confirmed" adalah true (user bilang pesanan sudah lengkap dan mau dibikin bonnya/pesan sekarang).
-- Gunakan productId yang sesuai dari menu.
-- Jika user belum selesai pesan (masih nanya "ada apa aja?", "tambahin Mangg dong"), isi orders_to_checkout dengan [] dan is_checkout_confirmed dengan false.`;
+rules: 
+- orders_to_checkout diisi JIKA DAN HANYA JIKA is_checkout_confirmed=true (user bilang fix pesen sekarang).
+Menu:
+${menuText}`;
 
   const messages = [
     { role: 'system', content: systemPrompt },
